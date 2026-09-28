@@ -28,6 +28,77 @@ after:   [S1] → "[5] Ndiaye AB, Kowalczyk PT. Waist-to-height ratio as an adju
 - **OpenResponses-style API.** `POST /responses` returns the answer with `url_citation`
   annotations, as JSON or a server-sent event stream.
 
+## How the RAG system works
+
+RAG (retrieval-augmented generation) means the model never answers from memory: the system first
+**retrieves** the passages that matter, then asks the model to answer **only from them**, and
+every sentence points back to its source. Here is the journey of a PDF, then of a question.
+
+### 1. A PDF becomes searchable (ingest)
+
+Uploading a PDF returns immediately (`202`). The work happens in the background, on five workers
+connected by RabbitMQ queues:
+
+1. **parse**: PyMuPDF extracts the text, page by page.
+2. **chunk**: each page is cut into windows of about **1,200 characters with 150 of overlap**,
+   preferring to cut at a paragraph or sentence break, so an idea is rarely split in half.
+3. **embed**: each chunk becomes a vector of **1,024 numbers** that captures its meaning
+   (`qwen3-embedding:0.6b`). Texts that mean similar things get vectors that point in similar
+   directions.
+4. **citation**: the chat model extracts the PDF's own title, authors, year and journal, used
+   later for filtering.
+5. **index**: chunks and vectors are written to Postgres, where an **HNSW index** (pgvector)
+   makes "find the closest vectors" fast, even across many thousands of chunks.
+
+Every step's result is cached under a hash of the file's **content**, the step and its version.
+Uploading the same bytes again costs nothing, and changing one step only re-runs that step.
+
+### 2. A question finds its evidence (retrieve)
+
+- **Filters:** one quick chat call checks whether the question names an author, year or journal
+  (*"what did Chen publish in 2021?"*). A filter is kept only if it really appears in the
+  question, and if it matches nothing, the search widens instead of answering "no results".
+- **Search, always:** the question is embedded the same way as the chunks, and the **10 closest
+  chunks** by cosine distance are returned. This is a fixed step in the agent's graph, not the
+  model's choice, so an answer can never skip the evidence.
+- **Labelling:** the results are handed to the model as `[S1]` … `[S10]`, each with its file,
+  page and text.
+
+### 3. The model answers (generate)
+
+The agent (LangGraph, `qwen3.5:0.8b` by default) is instructed to answer only from the results,
+to end every sentence it took from a result with that result's label, and to say so plainly when
+the results don't contain the answer. It may search again with different words if the first
+results miss something.
+
+### 4. Every claim gets a source (cite)
+
+Each `[Sn]` in the answer is turned into a structured `url_citation` annotation. A label that
+points at no real result, which small models sometimes invent, is dropped: no citation is better
+than a fake one.
+
+Then the part this project adds: **second order references**. Scientific text is full of claims
+that are themselves citations: *"...recommended as adjunct measures⁵"*. Citing "this PDF, page 2"
+for that sentence credits the wrong people. So, before the model answers, each retrieved chunk is
+scanned for citation marks (`5`, `1-3`, `[2,4]`) and linked to its document's reference list;
+after it answers, the model's sentence is matched to the cited sentence it restates, and the
+annotation names the **original study**. Details in
+[Second order references](#second-order-references).
+
+### Lessons from running it on a 0.8B model
+
+Small local models make every weakness visible, which made them a good test bench:
+
+- **Answers stopped after two words.** Ten retrieved chunks filled the model's default
+  4,096-token context window, leaving no room to write. Raising it to 8,192 fixed it: a bigger
+  window costs a little memory, while the amount of text the model reads stays the same.
+- **The model sometimes skipped the search** and answered from memory, with invented labels like
+  `[S4]` and made-up authors. The citation code dropped them, but the answer wasn't grounded. A
+  prompt can only ask; the graph now guarantees the search runs.
+- **Numbers that look like citations.** `kg/m²` comes out of a PDF as `kg/m2`, and the `2` was
+  read as a citation of reference 2. The fix was a general rule: a number is a citation only if
+  every number in it exists in that document's reference list.
+
 ## Architecture
 
 ```
