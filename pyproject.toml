@@ -1,0 +1,51 @@
+[project]
+name = "take-home"
+version = "0.1.0"
+description = "uv workspace root: apps/* build on packages/*."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "api",
+    "pipeline",
+    "basedpyright>=1.21",
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/*", "packages/*"]
+exclude = []
+
+[tool.uv.sources]
+api = { workspace = true }
+pipeline = { workspace = true }
+
+[tool.basedpyright]
+include = ["apps", "packages", "tests"]
+exclude = ["**/__pycache__", "**/migrations/versions", ".venv"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportExplicitAny = "error"
+reportAny = "warning"
+reportUnknownParameterType = "error"
+reportUnknownVariableType = "warning"
+reportUnknownMemberType = "warning"
+reportUnknownArgumentType = "warning"
+reportMissingTypeStubs = "none"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint.isort]
+# The apps, explicitly. Ruff infers this from the source root, and inside a nested package it
+# guesses wrong and folds `api` in with the third-party imports. `core` and `domain` are
+# deliberately absent: they are installed distributions here, and the existing files sort them as
+# such.
+known-first-party = ["api", "pipeline"]

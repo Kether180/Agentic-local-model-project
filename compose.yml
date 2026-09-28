@@ -1,0 +1,221 @@
+name: take-home
+
+x-app-env: &app-env
+  APP_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/take_home
+  APP_RABBIT_URL: amqp://guest:guest@rabbitmq:5672/
+  # Chat: Ollama (default: local, no credentials needed)
+  APP_CHAT__PROVIDER: ollama
+  APP_CHAT__BASE_URL: http://ollama:11434
+  # Chat: Bedrock (needs the ~/.aws mount below)
+  # APP_CHAT__PROVIDER: bedrock
+  # APP_CHAT__REGION: eu-central-1 # or whatever your AWS region is
+  # Embeddings: Ollama (default: qwen3-embedding:0.6b, 1024-wide)
+  APP_EMBEDDING__PROVIDER: ollama
+  APP_EMBEDDING__BASE_URL: http://ollama:11434
+  # Embeddings: Bedrock (Cohere Embed v4, also 1024-wide)
+  # APP_EMBEDDING__PROVIDER: bedrock  # requires credentials
+  # APP_EMBEDDING__REGION: eu-central-1
+  #
+  # Uncomment these together with either Bedrock block above AND the ~/.aws mounts below.
+  # Not inert while Ollama is selected: boto3 reads AWS_PROFILE for every client it builds,
+  # including the MinIO one, so a profile with no ~/.aws mounted fails uploads with
+  # `ProfileNotFound` without anything going near Bedrock.
+  # AWS_PROFILE: your-aws-profile
+  # AWS_REGION: eu-central-1
+
+  APP_BLOB__ENDPOINT_URL: http://minio:9000
+  APP_BLOB__BUCKET: documents
+  APP_BLOB__ACCESS_KEY: minioadmin
+  APP_BLOB__SECRET_KEY: minioadmin
+
+x-pipeline: &pipeline
+  build:
+    context: .
+    dockerfile: apps/pipeline/Dockerfile
+  environment: *app-env
+  # Uncomment to allow you AWS credentials to be used in the pipeline service
+  # volumes:
+  #   - ~/.aws:/home/nonroot/.aws:ro  # :ro = read-only (your aws creds)
+  develop:
+    watch:
+      - action: sync+restart
+        path: ./apps/pipeline/src
+        target: /app/apps/pipeline/src
+        ignore: ["**/__pycache__/"]
+      - action: sync+restart
+        path: ./packages/core/src
+        target: /app/packages/core/src
+        ignore: ["**/__pycache__/"]
+      - action: sync+restart
+        path: ./packages/domain/src
+        target: /app/packages/domain/src
+        ignore: ["**/__pycache__/"]
+      - action: rebuild
+        path: ./uv.lock
+  restart: unless-stopped
+  # The model calls happen in these workers: citation = chat, embed = embeddings. parse, chunk
+  # and index never call a model — they share this anchor for everything else.
+  depends_on:
+    rabbitmq: {condition: service_healthy}
+    migrate: {condition: service_completed_successfully}
+    minio: {condition: service_healthy}
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports: ["5672:5672", "15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: take_home
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d take_home"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes: [postgres-data:/var/lib/postgresql/data]
+
+  ollama:
+    image: ollama/ollama
+    ports: ["11434:11434"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes: [ollama-data:/root/.ollama]
+
+  # One-shot: pull the two models into the shared volume, then exit.
+  ollama-init:
+    image: ollama/ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        export OLLAMA_HOST=http://ollama:11434
+        ollama pull qwen3-embedding:0.6b
+        ollama pull qwen3.5:0.8b
+        echo "models ready"
+    depends_on:
+      ollama: {condition: service_healthy}
+    restart: "no"
+
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes: [minio-data:/data]
+
+  # One-shot: create the bucket, then exit.
+  minio-init:
+    image: quay.io/minio/mc
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/documents
+        echo "bucket ready"
+    depends_on:
+      minio: {condition: service_healthy}
+    restart: "no"
+
+  # One-shot: alembic upgrade head. Everything that touches the DB waits on this.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: *app-env
+    working_dir: /app/packages/domain
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment: *app-env
+    ports: ["8000:8000"]
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/api/src
+          target: /app/apps/api/src
+          ignore: ["**/__pycache__/"]
+        - action: sync+restart
+          path: ./packages/core/src
+          target: /app/packages/core/src
+          ignore: ["**/__pycache__/"]
+        - action: sync+restart
+          path: ./packages/domain/src
+          target: /app/packages/domain/src
+          ignore: ["**/__pycache__/"]
+        - action: rebuild
+          path: ./uv.lock
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_healthy}
+    restart: unless-stopped
+    # Uncomment to allow you AWS credentials to be used in the api service
+    # volumes:
+    #   - ~/.aws:/home/nonroot/.aws:ro  # :ro = read-only (your aws creds)
+
+  pipeline-parse:
+    <<: *pipeline
+    command: ["pipeline", "parse"]
+
+  pipeline-chunk:
+    <<: *pipeline
+    command: ["pipeline", "chunk"]
+
+  # The expensive step: scaled out. `docker compose up -d --scale pipeline-embed=4`
+  pipeline-embed:
+    <<: *pipeline
+    command: ["pipeline", "embed"]
+    deploy:
+      replicas: 2
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_healthy}
+      ollama-init: {condition: service_completed_successfully}
+
+  pipeline-citation:
+    <<: *pipeline
+    command: ["pipeline", "citation"]
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_healthy}
+      ollama-init: {condition: service_completed_successfully}
+
+  pipeline-index:
+    <<: *pipeline
+    command: ["pipeline", "index"]
+
+volumes:
+  rabbitmq-data:
+  postgres-data:
+  ollama-data:
+  minio-data:

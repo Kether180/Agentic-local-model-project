@@ -1,0 +1,34 @@
+[project]
+name = "api"
+version = "0.1.0"
+description = "FastAPI application: document ingest and semantic search."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "core",
+    "domain",
+    "fastapi[standard-no-fastapi-cloud-cli]>=0.115",
+    "langgraph>=1.2.11",
+]
+
+[project.scripts]
+api = "api.main:run"
+
+[tool.uv.sources]
+core = { workspace = true }
+domain = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"
+
+[tool.basedpyright]
+venvPath = "../../"
+venv = ".venv"
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+

@@ -1,0 +1,33 @@
+# Local override: S3Mock instead of MinIO. Local development only.
+#
+# On 24 Sep 2026 the MinIO images (quay.io/minio/minio, quay.io/minio/mc) could not be pulled in
+# my environment ("unauthorized"). S3Mock speaks the same S3 API, so no code changes are needed.
+#
+#   docker compose -f compose.yml -f compose.s3mock.yml up -d --build
+
+x-blob-endpoint: &blob-endpoint
+  APP_BLOB__ENDPOINT_URL: http://minio:9090  # S3Mock's HTTP port
+
+services:
+  minio:
+    image: adobe/s3mock
+    command: !reset []
+    ports: !reset []
+    user: root  # local dev only: the named volume is root-owned, S3Mock runs as uid 1000
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: documents  # replaces minio-init
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /data
+      COM_ADOBE_TESTING_S3MOCK_STORE_RETAIN_FILES_ON_EXIT: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/ || exit 1"]  # no curl in image
+
+  minio-init:
+    profiles: [minio]  # not started: S3Mock creates the bucket itself
+
+  migrate: {environment: *blob-endpoint}
+  api: {environment: *blob-endpoint}
+  pipeline-parse: {environment: *blob-endpoint}
+  pipeline-chunk: {environment: *blob-endpoint}
+  pipeline-embed: {environment: *blob-endpoint}
+  pipeline-citation: {environment: *blob-endpoint}
+  pipeline-index: {environment: *blob-endpoint}
